@@ -2,23 +2,26 @@ Language: **English** [简体中文](./cn_README.md)
 
 # DDSP-SVC
 
-The SoftVcStylizer frontend workflow for preprocessing, inference, GAN training, and feature indexing is documented in [FRONTEND.md](FRONTEND.md). Start there for CUDA setup, the focused requirements, configuration, and CLI examples.
-
 ## 0. Introduction
 
-DDSP-SVC is an open source singing voice conversion project dedicated to the development of free AI voice changer software that can be popularized on personal computers. This branch builds on upstream DDSP / Rectified-Flow and provides training and inference workflows with the SoftVcStylizer frontend, the full audio discriminator, and NSF-HifiGAN.
+DDSP-SVC is an open source singing voice conversion project. This branch builds on upstream DDSP / Rectified-Flow and provides training and inference workflows with the SoftVcStylizer frontend, the full audio discriminator, and NSF-HifiGAN.
 
 Compared with upstream DDSP, this repository improves pronunciation in synthesized speech and more faithfully reconstructs the target speaker's timbre, at the cost of higher training resource requirements.
 
-Compared with the famous [SO-VITS-SVC](https://github.com/svc-develop-team/so-vits-svc), its training and synthesis have much lower requirements for computer hardware, and the training time can be shortened by orders of magnitude, which is close to the training speed of [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI).
+This branch supports the following four entry points:
 
-In addition, when performing real-time voice changing, the hardware resource consumption of this project is significantly lower than that of SO-VITS-SVC, but probably slightly higher than the latest version of RVC.
+| Entry point | Purpose |
+| --- | --- |
+| [`preprocess.py`](preprocess.py) | Extract ContentVec, Whisper PPG, HuBERT Soft, speaker embeddings, pitch, volume, and mel spectrogram features. |
+| [`train_frontend_vc_gan.py`](train_frontend_vc_gan.py) | Freeze the base model's DDSP parameters and train the SoftVcStylizer frontend with the full audio discriminator. |
+| [`train_index.py`](train_index.py) | Build separate FAISS feature indexes for ContentVec, HuBERT, and Whisper. |
+| [`main_reflow.py`](main_reflow.py) | Convert audio using the base model, the optional SoftVcStylizer frontend, and feature retrieval. |
 
-Although the original synthesis quality of DDSP is not ideal, after enhancing the sound quality with a pre-trained vocoder based enhancer (old version), a shallow diffusion model (later versions) or a rectified-flow model (current version), for some datasets, it can achieve the synthesis quality no less than SOVITS-SVC and RVC.
+ContentVec uses this codebase's Hugging Face implementation and the `pytorch_model.bin` weight format. 
+
+The release does not include personal trained weights, speaker embeddings, datasets, preprocessing caches, or retrieval indexes. Users must prepare these resources or generate them through preprocessing and training. See [cn_FRONTEND.md](cn_FRONTEND.md) for the Chinese frontend guide, [FRONTEND.md](FRONTEND.md) for the English guide.
 
 Disclaimer: Please make sure to only train DDSP-SVC models with **legally obtained authorized data**, and do not use these models and any audio they synthesize for illegal purposes. The author of this repository is not responsible for any infringement, fraud and other illegal acts caused by the use of these model checkpoints and audio.
-
-Update log: I am too lazy to translate, please see the Chinese version readme.
 
 ## 1. Installing the dependencies
 

@@ -6,7 +6,7 @@ DDSP-SVC 是一个开源歌声转换项目。本分支在上游 DDSP / Rectified
 
 与上游 DDSP 相比，本仓库改善了合成语音的发音表现，并提高了目标说话人音色的还原度，代价是需要更高的训练成本。
 
-本次迁移主要支持以下四个入口：
+本分支要支持以下四个入口：
 
 | 入口 | 用途 |
 | --- | --- |
@@ -15,9 +15,8 @@ DDSP-SVC 是一个开源歌声转换项目。本分支在上游 DDSP / Rectified
 | [`train_index.py`](train_index.py) | 分别建立 ContentVec、HuBERT 和 Whisper 的 FAISS 特征索引。 |
 | [`main_reflow.py`](main_reflow.py) | 使用基模型、可选的 SoftVcStylizer 前端及特征检索进行音频转换。 |
 
-ContentVec 使用目标代码库中的 Hugging Face 实现和 `pytorch_model.bin` 权重格式。BigVGAN、旧版 stylizer、Fairseq ContentVec、小型判别器及实验性残差模型不在本分支的迁移范围内。
-
-发布代码不附带个人训练权重、说话人嵌入、数据集、预处理缓存或检索索引。这些资源由使用者自行准备或训练生成。中文前端操作说明见 [cn_FRONTEND.md](cn_FRONTEND.md)，英文版见 [FRONTEND.md](FRONTEND.md)，迁移与验证记录见 [MIGRATION_REPORT.md](MIGRATION_REPORT.md)。
+ContentVec 使用目标代码库中的 Hugging Face 实现和 `pytorch_model.bin` 权重格式。
+发布代码不附带个人训练权重、说话人嵌入、数据集、预处理缓存或检索索引。这些资源由使用者自行准备或训练生成。中文前端操作说明见 [cn_FRONTEND.md](cn_FRONTEND.md)，英文版见 [FRONTEND.md](FRONTEND.md)。
 
 免责声明：请确保仅使用**合法获得的授权数据**训练 DDSP-SVC 模型，不要将这些模型及其合成的任何音频用于非法目的。本库作者不对因使用这些模型检查点和音频而造成的任何侵权、诈骗等违法行为负责。
 
@@ -232,13 +231,6 @@ TensorBoard 日志默认写入前端实验目录下的 `logs/`：
 ```
 
 流程已在独立 Python 3.11 环境通过 29 项回归检查，并验证了实际编码器、单进程/多进程预处理、三路索引、检索开关推理以及前端训练与恢复。测试使用临时数据和新初始化的检查点，用于验证计算和流程；实际音色质量需要使用自己的数据训练后评估。
-
-本次迁移包含两个明确修正：
-
-1. 音频裁切起点和长度使用配置中的输出 `block_size`，与已经对齐的缓存特征保持一致；默认配置按 512 个采样点一帧计算。
-2. 说话人编码器接收单独重采样至 16 kHz 的输入，并使用所选设备；其他特征继续使用原始训练采样率的音频。
-
-同时保留上游的 STFT / ONNX 填充修正、预处理多进程和 FP16 存储支持。检索映射的数值行为保持不变。
 
 ## 8. 感谢
 
