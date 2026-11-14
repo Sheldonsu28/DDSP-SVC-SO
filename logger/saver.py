@@ -16,9 +16,9 @@ class Saver(object):
     def __init__(
             self, 
             args,
-            initial_global_step=-1):
+            initial_global_step=-1, expdir=None):
 
-        self.expdir = args.env.expdir
+        self.expdir = expdir or args.env.expdir
         self.sample_rate = args.data.sampling_rate
         
         # cold start
@@ -141,3 +141,14 @@ class Saver(object):
         self.global_step += 1
 
 
+
+
+    def save_gan_model(self, model, model_d, optimizer, optimizer_d, name='model', postfix='', to_json=False):
+        if postfix:
+            postfix = '_' + postfix
+        path_pt = os.path.join(self.expdir, name + postfix + '.pt')
+        print(' [*] model checkpoint saved: {}'.format(path_pt))
+        if optimizer is not None:
+            torch.save({'global_step': self.global_step, 'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'model_d': model_d.state_dict(), 'optimizer_d': optimizer_d.state_dict()}, path_pt)
+        else:
+            torch.save({'global_step': self.global_step, 'model': model.state_dict(), 'model_d': model_d.state_dict()}, path_pt)

@@ -108,3 +108,36 @@ def load_model(
         if ckpt.get('optimizer') != None:
             optimizer.load_state_dict(ckpt['optimizer'])
     return global_step, model, optimizer
+
+
+def load_gan_model(expdir, model_g, optimizer, model_d, optimizer_d,
+                   name='model', postfix='', device='cpu', allow_missing_discriminator=False):
+    """Restore a SoftVcStylizer checkpoint; a missing experiment starts from fresh models."""
+    from pathlib import Path
+    directory = Path(expdir)
+    model_g.to(device)
+    model_d.to(device)
+    if directory.suffix == '.pt':
+        path = directory
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    elif postfix:
+        path = directory / f'{name}_{postfix}.pt'
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    else:
+        candidates = [(int(p.stem[len(name) + 1:]), p) for p in directory.glob(f'{name}_*.pt')
+                      if p.stem[len(name) + 1:].isdigit()]
+        if not candidates:
+            return 0, model_g, optimizer, model_d, optimizer_d
+        path = max(candidates, key=lambda item: item[0])[1]
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    model_g.load_state_dict(checkpoint['model'], strict=True)
+    if 'model_d' in checkpoint:
+        model_d.load_state_dict(checkpoint['model_d'], strict=True)
+    elif not allow_missing_discriminator:
+        raise KeyError('model_d')
+    for key, value in (('optimizer', optimizer), ('optimizer_d', optimizer_d)):
+        if value is not None and checkpoint.get(key) is not None:
+            value.load_state_dict(checkpoint[key])
+    return checkpoint.get('global_step', 0), model_g, optimizer, model_d, optimizer_d

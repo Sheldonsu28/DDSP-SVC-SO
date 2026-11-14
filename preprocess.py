@@ -1,320 +1,208 @@
-import os
-import numpy as np
-import random
-import librosa
-import torch
+"""Preprocess upstream or SoftVcStylizer features with per-worker model initialization."""
 import argparse
-import shutil
 import concurrent.futures
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+
+import librosa
+import numpy as np
+import torch
 import torch.multiprocessing as mp
-from logger import utils
 from tqdm import tqdm
+
 from ddsp.vocoder import F0_Extractor, Volume_Extractor, Units_Encoder
+from frontend import apply_overrides, auxiliary_encoders, options
+from logger import utils
 from reflow.vocoder import Vocoder
-from logger.utils import traverse_dir
+
+_worker = {}
 
 
 def parse_args(args=None, namespace=None):
-    """Parse command-line arguments."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-c",
-        "--config",
-        type=str,
-        required=True,
-        help="path to the config file")
-    parser.add_argument(
-        "-d",
-        "--device",
-        type=str,
-        default=None,
-        required=False,
-        help="cpu or cuda, auto if not set")
-    parser.add_argument(
-        "-j",
-        "--workers",
-        type=int,
-        default=2,
-        required=False,
-        help="number of worker processes (default: 2)")
-    parser.add_argument(
-        "--store_dtype",
-        type=str,
-        choices=['fp32', 'fp16'],
-        default='fp32',
-        required=False,
-        help="dtype for the units/mel/aug_mel .npy files; f0/volume/aug_vol are "
-             "always fp32 | default: fp32")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-c", "--config", required=True)
+    parser.add_argument("-d", "--device", default=None)
+    parser.add_argument("-j", "--workers", type=int, default=None,
+                        help="Worker processes; default 2 upstream, 1 with the multi-encoder frontend")
+    parser.add_argument("--store_dtype", choices=("fp32", "fp16"), default="fp32")
+    parser.add_argument("--frontend", action="store_true", help="Extract SoftVcStylizer auxiliary features and speaker embeddings")
     return parser.parse_args(args=args, namespace=namespace)
 
 
-def load_extractors(args, sample_rate=None, hop_size=None, device='cuda'):
-    if sample_rate is None:
-        sample_rate = args.data.sampling_rate
-    if hop_size is None:
-        hop_size = args.data.block_size
-    
-    # initialize f0 extractor
-    f0_extractor = F0_Extractor(
-                        args.data.f0_extractor, 
-                        sample_rate, 
-                        hop_size, 
-                        args.data.f0_min, 
-                        args.data.f0_max)
-    
-    # initialize volume extractor
-    volume_extractor = Volume_Extractor(hop_size, args.data.volume_smooth_size)
-    
-    # initialize mel extractor
-    mel_extractor = Vocoder(args.vocoder.type, args.vocoder.ckpt, device=device)
-    if mel_extractor.vocoder_sample_rate != sample_rate or mel_extractor.vocoder_hop_size != hop_size:
-        mel_extractor = None
-        print('Unmatch vocoder parameters, mel extraction is ignored!')
-    
-    # initialize units encoder
-    if args.data.encoder == 'cnhubertsoftfish':
-        cnhubertsoft_gate = args.data.cnhubertsoft_gate
-    else:
-        cnhubertsoft_gate = 10
-    units_encoder = Units_Encoder(
-                        args.data.encoder, 
-                        args.data.encoder_ckpt, 
-                        args.data.encoder_sample_rate, 
-                        args.data.encoder_hop_size,
-                        cnhubertsoft_gate=cnhubertsoft_gate,
-                        device=device)
-    return f0_extractor, volume_extractor, mel_extractor, units_encoder
-    
-    
-# Global variables for worker processes (each process has its own copy)
-_worker_f0_extractor = None
-_worker_volume_extractor = None
-_worker_mel_extractor = None
-_worker_units_encoder = None
-_worker_device = None
-_worker_store_dtype = None
+def speaker_model_input(audio, sample_rate, device):
+    """Resample only the speaker-model input; do not change training-rate audio."""
+    from torchaudio.functional import resample
+
+    waveform = torch.as_tensor(audio, dtype=torch.float32, device=device).reshape(1, -1)
+    if sample_rate != 16000:
+        waveform = resample(waveform, sample_rate, 16000)
+    return waveform
 
 
-def _dtype_cast(arr, dtype):
-    """Cast to the requested dtype and guarantee C-contiguity for np.save."""
-    return np.ascontiguousarray(arr, dtype=dtype)
+def load_extractors(args, sample_rate=None, hop_size=None, device="cuda"):
+    sample_rate = sample_rate or args.data.sampling_rate
+    hop_size = hop_size or args.data.block_size
+    pitch = F0_Extractor(args.data.f0_extractor, sample_rate, hop_size, args.data.f0_min, args.data.f0_max)
+    volume = Volume_Extractor(hop_size, args.data.volume_smooth_size)
+    mel = Vocoder(args.vocoder.type, args.vocoder.ckpt, device=device)
+    if mel.vocoder_sample_rate != sample_rate or mel.vocoder_hop_size != hop_size:
+        raise ValueError("Vocoder sample rate/hop must match data.sampling_rate/data.block_size")
+    units = Units_Encoder(args.data.encoder, args.data.encoder_ckpt,
+                          args.data.encoder_sample_rate, args.data.encoder_hop_size,
+                          cnhubertsoft_gate=args.data.get("cnhubertsoft_gate", 10), device=device)
+    return pitch, volume, mel, units
 
 
 def _worker_init(args, device, store_dtype):
-    """Initialize extractors for each worker process."""
-    global _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder, _worker_device, _worker_store_dtype
-    _worker_device = device
-    _worker_store_dtype = store_dtype
-    _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder = load_extractors(
-        args, device=device)
+    global _worker
+    args = utils.DotDict(args)
+    pitch, volume, mel, units = load_extractors(args, device=device)
+    _worker = dict(pitch=pitch, volume=volume, mel=mel, units=units,
+                   device=device, dtype=store_dtype, frontend=bool(options(args).get("enabled")))
+    if _worker["frontend"]:
+        from speechbrain.inference.classifiers import EncoderClassifier
+        from speechbrain.utils.fetching import LocalStrategy
+
+        settings = options(args)
+        whisper, hubert = auxiliary_encoders(args, device)
+        speaker_device = torch.device(device)
+        if speaker_device.type == "cuda" and speaker_device.index is None:
+            speaker_device = torch.device("cuda", torch.cuda.current_device())
+        classifier = EncoderClassifier.from_hparams(
+            source=settings.get("speaker_encoder", "speechbrain/spkrec-ecapa-voxceleb"),
+            savedir=settings.get("speaker_encoder_cache", "cache/speaker_encoder"),
+            run_opts={"device": str(speaker_device)},
+            local_strategy=LocalStrategy.COPY,
+        )
+        _worker.update(whisper=whisper, hubert=hubert, speaker=classifier)
 
 
+def _dtype_cast(array, dtype):
+    return np.ascontiguousarray(array, dtype=dtype)
+
+
+@torch.no_grad()
 def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
-    """
-    Process a single audio file using either provided extractors or worker-global extractors.
+    source = Path(path) / "audio" / file
+    audio, _ = librosa.load(source, sr=sample_rate, mono=True)
+    device = _worker["device"]
+    waveform = torch.from_numpy(audio).float().to(device).unsqueeze(0)
+    f0 = _worker["pitch"].extract(audio, uv_interp=False, device=device)
+    unvoiced = f0 == 0
+    if not np.any(~unvoiced):
+        destination = Path(path) / "skip" / file
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(destination))
+        print(f"F0 extraction failed; moved to {destination}")
+        return None
+    f0[unvoiced] = np.interp(np.where(unvoiced)[0], np.where(~unvoiced)[0], f0[~unvoiced])
+    maximum = float(waveform.abs().max()) + 1e-5
+    volume_shift = random.uniform(-1, min(1, np.log10(1 / maximum)))
+    keyshift = random.uniform(-5, 5) if use_pitch_aug else 0
+    amplitude = 10 ** volume_shift
 
-    Args:
-        file: Audio filename
-        path: Base directory path
-        sample_rate, hop_size: Audio parameters
-        use_pitch_aug: Whether to use pitch augmentation
-        extensions: Audio file extensions
-        f0_extractor, volume_extractor, mel_extractor, units_encoder: Optional extractors
-        device: Optional processing device
+    def array(tensor):
+        return tensor.squeeze(0).float().cpu().numpy()
 
-    Returns:
-        keyshift value if successful, None otherwise
-    """
-    global _worker_f0_extractor, _worker_volume_extractor, _worker_mel_extractor, _worker_units_encoder, _worker_device
-
-    # Use provided extractors if available, otherwise use global ones
-    f0_extractor = _worker_f0_extractor
-    volume_extractor = _worker_volume_extractor
-    mel_extractor = _worker_mel_extractor
-    units_encoder = _worker_units_encoder
-    device = _worker_device
-
-    path_srcdir  = os.path.join(path, 'audio')
-    path_unitsdir  = os.path.join(path, 'units')
-    path_f0dir  = os.path.join(path, 'f0')
-    path_volumedir  = os.path.join(path, 'volume')
-    path_augvoldir  = os.path.join(path, 'aug_vol')
-    path_meldir  = os.path.join(path, 'mel')
-    path_augmeldir  = os.path.join(path, 'aug_mel')
-    path_skipdir = os.path.join(path, 'skip')
-
-    binfile = file+'.npy'
-    path_srcfile = os.path.join(path_srcdir, file)
-    path_unitsfile = os.path.join(path_unitsdir, binfile)
-    path_f0file = os.path.join(path_f0dir, binfile)
-    path_volumefile = os.path.join(path_volumedir, binfile)
-    path_augvolfile = os.path.join(path_augvoldir, binfile)
-    path_melfile = os.path.join(path_meldir, binfile)
-    path_augmelfile = os.path.join(path_augmeldir, binfile)
-    path_skipfile = os.path.join(path_skipdir, file)
-    
-    # load audio
-    audio, _ = librosa.load(path_srcfile, sr=sample_rate)
-    if len(audio.shape) > 1:
-        audio = librosa.to_mono(audio)
-    audio_t = torch.from_numpy(audio).float().to(device)
-    audio_t = audio_t.unsqueeze(0)
-    
-    # extract volume
-    volume = volume_extractor.extract(audio)
-    
-    # extract mel and volume augmentaion
-    if mel_extractor is not None:
-        mel_t = mel_extractor.extract(audio_t, sample_rate)
-        mel = mel_t.squeeze().to('cpu').numpy()
-        
-        max_amp = float(torch.max(torch.abs(audio_t))) + 1e-5
-        max_shift = min(1, np.log10(1/max_amp))
-        log10_vol_shift = random.uniform(-1, max_shift)
-        if use_pitch_aug:
-            keyshift = random.uniform(-5, 5)
+    features = {
+        "units": array(_worker["units"].encode(waveform, sample_rate, hop_size)),
+        "mel": array(_worker["mel"].extract(waveform, sample_rate)),
+        "aug_mel": array(_worker["mel"].extract(waveform * amplitude, sample_rate, keyshift=keyshift)),
+        "f0": f0,
+        "volume": _worker["volume"].extract(audio),
+        "aug_vol": _worker["volume"].extract(audio * amplitude),
+    }
+    if _worker["frontend"]:
+        for key, encoder in (("whisper_units", _worker["whisper"]), ("hubert_units", _worker["hubert"])):
+            features[key] = array(encoder.encode(waveform, sample_rate, hop_size))
+        speaker_audio = speaker_model_input(audio, sample_rate, device)
+        features["speaker"] = _worker["speaker"].encode_batch(speaker_audio).squeeze().float().cpu().numpy()
+        if keyshift:
+            shifted = librosa.effects.pitch_shift(audio, sr=sample_rate, n_steps=keyshift)
+            shifted = np.pad(shifted[:len(audio)], (0, max(0, len(audio) - len(shifted))))
+            shifted_waveform = torch.from_numpy(shifted).float().to(device).unsqueeze(0)
+            for key, encoder in (("units_aug", _worker["units"]),
+                                 ("whisper_units_aug", _worker["whisper"]),
+                                 ("hubert_units_aug", _worker["hubert"])):
+                features[key] = array(encoder.encode(shifted_waveform, sample_rate, hop_size))
         else:
-            keyshift = 0
-        
-        aug_mel_t = mel_extractor.extract(audio_t * (10 ** log10_vol_shift), sample_rate, keyshift = keyshift)
-        aug_mel = aug_mel_t.squeeze().to('cpu').numpy()
-        aug_vol = volume_extractor.extract(audio * (10 ** log10_vol_shift))
-        
-    # units encode
-    units_t = units_encoder.encode(audio_t, sample_rate, hop_size)
-    units = units_t.squeeze().to('cpu').numpy()
-    
-    # extract f0
-    f0 = f0_extractor.extract(audio, uv_interp = False)
-    
-    uv = f0 == 0
-    if len(f0[~uv]) > 0:
-        # interpolate the unvoiced f0
-        f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+            for key in ("units", "whisper_units", "hubert_units"):
+                features["units_aug" if key == "units" else key + "_aug"] = features[key]
+    for key, value in features.items():
+        destination = Path(path) / key / (file + ".npy")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        dtype = np.float32 if key in ("f0", "volume", "aug_vol", "speaker") else _worker["dtype"]
+        np.save(destination, _dtype_cast(value, dtype))
+    return keyshift
 
-        # save npy
-        # Only units/mel/aug_mel honour --store_dtype. Training already halves
-        # exactly those three when train.cache_fp16 is set, so storing them as
-        # fp16 changes nothing there while cutting the disk footprint by ~40%.
-        # f0/volume/aug_vol stay fp32: they are small, and quantizing them would
-        # introduce error that the training path never had.
-        store_dtype = _worker_store_dtype or np.float32
-        os.makedirs(os.path.dirname(path_unitsfile), exist_ok=True)
-        np.save(path_unitsfile, _dtype_cast(units, store_dtype))
-        os.makedirs(os.path.dirname(path_f0file), exist_ok=True)
-        np.save(path_f0file, _dtype_cast(f0, np.float32))
-        os.makedirs(os.path.dirname(path_volumefile), exist_ok=True)
-        np.save(path_volumefile, _dtype_cast(volume, np.float32))
-        if mel_extractor is not None:
-            os.makedirs(os.path.dirname(path_melfile), exist_ok=True)
-            np.save(path_melfile, _dtype_cast(mel, store_dtype))
-            os.makedirs(os.path.dirname(path_augmelfile), exist_ok=True)
-            np.save(path_augmelfile, _dtype_cast(aug_mel, store_dtype))
-            os.makedirs(os.path.dirname(path_augvolfile), exist_ok=True)
-            np.save(path_augvolfile, _dtype_cast(aug_vol, np.float32))
-            return keyshift
+
+def save_speaker_means(path, files, n_spk=1):
+    """Save one FP32 mean per speaker from successfully preprocessed clips."""
+    totals, counts = {}, {}
+    for file in files:
+        speaker_id = 1
+        if n_spk is not None and n_spk > 1:
+            prefix = re.split(r"_|\-", os.path.dirname(file), 2)[0]
+            speaker_id = int(prefix) if prefix.isdigit() else 0
+            if not 1 <= speaker_id <= n_spk:
+                raise ValueError(f"Invalid speaker directory for {file}; expected 1..{n_spk}")
+        speaker = np.load(Path(path) / "speaker" / (file + ".npy")).astype(np.float32).squeeze()
+        if speaker_id not in totals:
+            totals[speaker_id] = speaker
+        else:
+            totals[speaker_id] += speaker
+        counts[speaker_id] = counts.get(speaker_id, 0) + 1
+    destination = Path(path) / "speaker_means"
+    destination.mkdir(exist_ok=True)
+    for speaker_id, total in totals.items():
+        np.save(destination / f"{speaker_id}.npy", total / counts[speaker_id])
+
+
+def preprocess(path, args, sample_rate=None, hop_size=None, device="cuda",
+               use_pitch_aug=False, extensions=("wav",), workers=1, store_dtype=None):
+    sample_rate = sample_rate or args.data.sampling_rate
+    hop_size = hop_size or args.data.block_size
+    files = utils.traverse_dir(str(Path(path) / "audio"), extensions,
+                               is_pure=True, is_sort=True, is_ext=True)
+    if not files:
+        print(f"No audio files found under {path}/audio")
+        return
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    store_dtype = np.float32 if store_dtype is None else store_dtype
+    initializer_args = (dict(args), device, store_dtype)
+    parameters = (path, sample_rate, hop_size, use_pitch_aug, extensions)
+    if workers == 1:
+        _worker_init(*initializer_args)
+        results = [_process_file(file, *parameters) for file in tqdm(files)]
     else:
-        print('\n[Error] F0 extraction failed: ' + path_srcfile)
-        os.makedirs(os.path.dirname(path_skipfile), exist_ok=True)
-        shutil.move(path_srcfile, os.path.dirname(path_skipfile))
-        print('This file has been moved to ' + path_skipfile)
-    return None
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers,
+                mp_context=mp.get_context("spawn"), initializer=_worker_init,
+                initargs=initializer_args) as executor:
+            futures = [executor.submit(_process_file, file, *parameters) for file in files]
+            results = [future.result() for future in tqdm(futures)]
+    pitch_shifts = {file: shift for file, shift in zip(files, results) if shift is not None}
+    np.save(Path(path) / "pitch_aug_dict.npy", pitch_shifts)
+    if options(args).get("enabled"):
+        save_speaker_means(path, pitch_shifts, args.model.n_spk)
 
 
-def preprocess(path, args, sample_rate=None, hop_size=None, device='cuda', use_pitch_aug=False, extensions=['wav'], workers=1, store_dtype=None):
-    # List files
-    path_srcdir = os.path.join(path, 'audio')
-    filelist = traverse_dir(
-        path_srcdir,
-        extensions=extensions,
-        is_pure=True,
-        is_sort=True,
-        is_ext=True)
+def main():
+    command = parse_args()
+    args = utils.load_config(command.config)
+    settings = apply_overrides(args, command)
+    device = command.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    workers = command.workers if command.workers is not None else (1 if settings.get("enabled") else 2)
+    store_dtype = np.float16 if command.store_dtype == "fp16" else np.float32
+    for path, augment in ((args.data.train_path, bool(args.model.use_pitch_aug)),
+                          (args.data.valid_path, False)):
+        preprocess(path, args, device=device, workers=workers, store_dtype=store_dtype,
+                   use_pitch_aug=augment, extensions=args.data.extensions)
 
-    # Ensure sample_rate and hop_size are set
-    if sample_rate is None:
-        sample_rate = args.data.sampling_rate
-    if hop_size is None:
-        hop_size = args.data.block_size
 
-    # Prepare arguments for worker initialization
-    init_args = (args, device, store_dtype)
-
-    # Multiprocessing with ProcessPoolExecutor
-    pitch_aug_dict = {}
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=_worker_init,
-        initargs=init_args
-    ) as executor:
-        # Submit tasks
-        future_to_file = {
-            executor.submit(_process_file, file, path, sample_rate, hop_size, use_pitch_aug, extensions): file
-            for file in filelist
-        }
-
-        # Collect results with progress bar
-        for future in tqdm(concurrent.futures.as_completed(future_to_file), total=len(filelist)):
-            file = future_to_file[future]
-            try:
-                keyshift = future.result()
-                if keyshift is not None:
-                    pitch_aug_dict[file] = keyshift
-            except Exception as e:
-                print(f'\n[Error] Task for {file} generated an exception: {e}')
-
-    # Save pitch augmentation dictionary if any
-    if len(pitch_aug_dict) > 0:
-        path_pitchaugdict = os.path.join(path, 'pitch_aug_dict.npy')
-        np.save(path_pitchaugdict, pitch_aug_dict)
-        print(f'Saved pitch augmentation dictionary to {path_pitchaugdict}')
-
-    
-if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)
-    
-    # parse commands
-    cmd = parse_args()
-
-    device = cmd.device
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-    # load config
-    args = utils.load_config(cmd.config)
-
-    sample_rate = args.data.sampling_rate
-    hop_size = args.data.block_size
-    extensions = args.data.extensions
-    train_path = args.data.train_path
-    valid_path = args.data.valid_path
-    use_pitch_aug = args.model.use_pitch_aug
-    
-    # get number of workers
-    workers = cmd.workers
-    print(f'Using {workers} worker processes')
-
-    store_dtype = np.float16 if cmd.store_dtype == 'fp16' else np.float32
-    print(f'Storing units/mel/aug_mel as {cmd.store_dtype}')
-
-    # parallel processing
-    preprocess(train_path,
-               args=args,
-               sample_rate=sample_rate,
-               hop_size=hop_size,
-               device=device,
-               use_pitch_aug=use_pitch_aug,
-               extensions=extensions,
-               workers=workers,
-               store_dtype=store_dtype)
-
-    # preprocess validation set (no pitch augmentation)
-    preprocess(valid_path,
-               args=args,
-               sample_rate=sample_rate,
-               hop_size=hop_size,
-               device=device,
-               use_pitch_aug=False,
-               extensions=extensions,
-               workers=workers,
-               store_dtype=store_dtype)
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    main()

@@ -1,0 +1,5 @@
+# Optional pitch extractors. RMVPE needs none of these packages.
+praat-parselmouth
+pyworld
+torchcrepe
+torchfcpe

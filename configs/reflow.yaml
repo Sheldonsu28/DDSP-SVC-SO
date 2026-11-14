@@ -1,9 +1,9 @@
 data:
   f0_extractor: 'rmvpe' # 'parselmouth', 'dio', 'harvest', 'crepe' or 'rmvpe'
   f0_min: 65 # about C2
-  f0_max: 800 # about G5
+  f0_max: 1060 # about C6
   sampling_rate: 44100
-  volume_smooth_size: 1024
+  volume_smooth_size: 256
   block_size: 512 # Equal to hop_length
   duration: 2 # Audio duration during training, must be less than the duration of the shortest audio clip
   encoder: 'contentvec768l12tta2x' # 'hubertsoft', 'contentvec768l12', 'contentvec768l12tta2x' or 'cnhubertsoftfish'

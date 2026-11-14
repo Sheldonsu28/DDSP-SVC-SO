@@ -2,9 +2,13 @@ Language: **English** [简体中文](./cn_README.md)
 
 # DDSP-SVC
 
+The SoftVcStylizer frontend workflow for preprocessing, inference, GAN training, and feature indexing is documented in [FRONTEND.md](FRONTEND.md). Start there for CUDA setup, the focused requirements, configuration, and CLI examples.
+
 ## 0. Introduction
 
-DDSP-SVC is an open source singing voice conversion project dedicated to the development of free AI voice changer software that can be popularized on personal computers.
+DDSP-SVC is an open source singing voice conversion project dedicated to the development of free AI voice changer software that can be popularized on personal computers. This branch builds on upstream DDSP / Rectified-Flow and provides training and inference workflows with the SoftVcStylizer frontend, the full audio discriminator, and NSF-HifiGAN.
+
+Compared with upstream DDSP, this repository improves pronunciation in synthesized speech and more faithfully reconstructs the target speaker's timbre, at the cost of higher training resource requirements.
 
 Compared with the famous [SO-VITS-SVC](https://github.com/svc-develop-team/so-vits-svc), its training and synthesis have much lower requirements for computer hardware, and the training time can be shortened by orders of magnitude, which is close to the training speed of [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI).
 
@@ -181,3 +185,13 @@ The front-end uses technologies such as sliding window, cross-fading, SOLA-based
 - [Diffusion-SVC](https://github.com/CNChTu/Diffusion-SVC)
 
 - [SO-VITS-SVC](https://github.com/svc-develop-team/so-vits-svc)
+
+- [whisper-vits-svc](https://github.com/PlayVoice/whisper-vits-svc)
+
+- [Whisper](https://github.com/openai/whisper)
+
+- [SpeechBrain](https://github.com/speechbrain/speechbrain)
+
+- [FAISS](https://github.com/facebookresearch/faiss)
+
+- [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)

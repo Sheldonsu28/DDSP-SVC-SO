@@ -1,11 +1,10 @@
 import os
+from pathlib import Path
 import torch
 import librosa
 import argparse
 import numpy as np
 import soundfile as sf
-import pyworld as pw
-import parselmouth
 import hashlib
 from ast import literal_eval
 from slicer import Slicer
@@ -13,6 +12,8 @@ from ddsp.vocoder import F0_Extractor, Volume_Extractor, Units_Encoder
 from ddsp.core import upsample
 from reflow.vocoder import load_model_vocoder
 from tqdm import tqdm
+from logger import utils
+from frontend import apply_overrides, auxiliary_encoders, load_frontend, load_indexes, retrieve
 
 def check_args(ddsp_args, diff_args):
     if ddsp_args.data.sampling_rate != diff_args.data.sampling_rate:
@@ -153,9 +154,32 @@ def parse_args(args=None, namespace=None):
         default='auto',
         help="t_start | default: auto",
     )
+    parser.add_argument('-c', '--config', default=None, help='Optional frontend configuration, including data.train_path for speaker means')
+    parser.add_argument('--frontend_checkpoint', default=None)
+    parser.add_argument('--speaker_embedding', default=None,
+                        help='Optional mean file/directory override; defaults to data.train_path/speaker_means/<spk_id>.npy')
+    parser.add_argument('--index_dir', default=None)
+    parser.add_argument('--contentvec_index', default=None)
+    parser.add_argument('--hubert_index', default=None)
+    parser.add_argument('--whisper_index', default=None)
+    parser.add_argument('--no_frontend', action='store_true')
+    parser.add_argument('-fr', '--f_retrieve', type=float, default=0.0,
+                        help='Positive values enable the source retrieval distribution mapping; default off')
     return parser.parse_args(args=args, namespace=namespace)
 
     
+def load_speaker_embedding(path, speaker_id, device="cpu", train_path=None):
+    """Load an override or the selected speaker's mean under the training path."""
+    if not path:
+        if not train_path:
+            raise ValueError("Frontend inference requires data.train_path or a speaker_embedding override")
+        path = Path(train_path) / "speaker_means" / f"{speaker_id}.npy"
+    path = Path(path)
+    if path.is_dir():
+        path = path / f"{speaker_id}.npy"
+    return torch.from_numpy(np.load(path)).float().to(device).squeeze()
+
+
 def split(audio, sample_rate, hop_size, db_thresh = -40, min_len = 5000):
     slicer = Slicer(
                 sr=sample_rate,
@@ -196,6 +220,26 @@ if __name__ == '__main__':
     
     # load reflow model
     model, vocoder, args = load_model_vocoder(cmd.model_ckpt, device=device)
+    train_path = args.data.train_path
+    if cmd.config:
+        resource_config = utils.load_config(cmd.config)
+        args['frontend'] = resource_config.get('frontend') or {}
+        train_path = (resource_config.get('data') or {}).get('train_path') or train_path
+    frontend_settings = apply_overrides(args, cmd)
+    use_frontend = bool(frontend_settings.get('enabled'))
+    style_model = None
+    speaker_embedding = None
+    auxiliary = None
+    if use_frontend:
+        if not frontend_settings.get('checkpoint'):
+            raise ValueError('Frontend inference requires a frontend checkpoint in config/CLI')
+        style_model = load_frontend(frontend_settings['checkpoint'], device,
+                                    frontend_settings.get('model'))
+        speaker_embedding = load_speaker_embedding(frontend_settings.get('speaker_embedding'),
+                                                   int(cmd.spk_id), device, train_path=train_path)
+        auxiliary = auxiliary_encoders(args, device)
+    indexes = load_indexes(frontend_settings, int(cmd.spk_id)) if cmd.f_retrieve > 0 else None
+
     
     # load input
     audio, sample_rate = librosa.load(cmd.input, sr=None)
@@ -322,14 +366,28 @@ if __name__ == '__main__':
             seg_input = torch.from_numpy(segment[1]).float().unsqueeze(0).to(device)
             seg_units = units_encoder.encode(seg_input, sample_rate, hop_size)
             seg_f0 = f0[:, start_frame : start_frame + seg_units.size(1), :]
-            seg_volume = volume[:, start_frame : start_frame + seg_units.size(1), :]    
+            seg_volume = volume[:, start_frame : start_frame + seg_units.size(1), :]
+            predicted_formant = 0
+            if use_frontend:
+                whisper_units = auxiliary[0].encode(seg_input, sample_rate, hop_size)
+                hubert_units = auxiliary[1].encode(seg_input, sample_rate, hop_size)
+                if indexes:
+                    seg_units = retrieve(seg_units, indexes['units'], 6)
+                    hubert_units = retrieve(hubert_units, indexes['hubert_units'], 6)
+                    whisper_units = retrieve(whisper_units, indexes['whisper_units'], 4)
+                outputs = style_model(seg_units, whisper_units, hubert_units, speaker_embedding,
+                                      None, seg_f0, seg_volume, infer=True, noise_fac=0.0, alpha=1.0)
+                seg_units, predicted_formant = outputs[0], outputs[10]
+            elif indexes:
+                seg_units = retrieve(seg_units, indexes['units'], 4)
+
             seg_mel = model(
                     seg_units, 
                     seg_f0 / vocal_register_factor, 
                     seg_volume, 
                     spk_id = spk_id, 
                     spk_mix_dict = spk_mix_dict,
-                    aug_shift = formant_shift_key,
+                    aug_shift = formant_shift_key + predicted_formant,
                     vocoder=vocoder,
                     infer_step=infer_step, 
                     method=method,
@@ -346,4 +404,3 @@ if __name__ == '__main__':
                 result = cross_fade(result, seg_output, current_length + silent_length)
             current_length = current_length + silent_length + len(seg_output)
         sf.write(cmd.output, result, args.data.sampling_rate)
-    

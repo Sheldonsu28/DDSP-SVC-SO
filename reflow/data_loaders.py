@@ -1,294 +1,178 @@
+"""Aligned upstream and SoftVcStylizer frontend training datasets."""
 import os
 import random
 import re
-import numpy as np
+from pathlib import Path
+
 import librosa
+import numpy as np
 import torch
-import random
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-from torch.utils.data import Dataset
-import concurrent.futures
+
+from logger.utils import traverse_dir
 
 
 def get_npy_shape(file_path):
-    with open(file_path, "rb") as f:
-        version = np.lib.format.read_magic(f)
-        if version == (1, 0):
-            shape = np.lib.format.read_array_header_1_0(f)[0]
-        elif version == (2, 0):
-            shape = np.lib.format.read_array_header_2_0(f)[0]
-        else:
-            raise ValueError("Unsupported .npy file version")
-    return shape
-        
-def traverse_dir(
-        root_dir,
-        extensions,
-        amount=None,
-        str_include=None,
-        str_exclude=None,
-        is_pure=False,
-        is_sort=False,
-        is_ext=True):
-
-    file_list = []
-    cnt = 0
-    for root, _, files in os.walk(root_dir):
-        for file in files:
-            if any([file.endswith(f".{ext}") for ext in extensions]):
-                # path
-                mix_path = os.path.join(root, file)
-                pure_path = mix_path[len(root_dir)+1:] if is_pure else mix_path
-
-                # amount
-                if (amount is not None) and (cnt == amount):
-                    if is_sort:
-                        file_list.sort()
-                    return file_list
-                
-                # check string
-                if (str_include is not None) and (str_include not in pure_path):
-                    continue
-                if (str_exclude is not None) and (str_exclude in pure_path):
-                    continue
-                
-                if not is_ext:
-                    ext = pure_path.split('.')[-1]
-                    pure_path = pure_path[:-(len(ext)+1)]
-                file_list.append(pure_path)
-                cnt += 1
-    if is_sort:
-        file_list.sort()
-    return file_list
+    with open(file_path, "rb") as stream:
+        version = np.lib.format.read_magic(stream)
+        reader = { (1, 0): np.lib.format.read_array_header_1_0,
+                   (2, 0): np.lib.format.read_array_header_2_0 }.get(version)
+        if reader is None:
+            raise ValueError(f"Unsupported NumPy file version: {version}")
+        return reader(stream)[0]
 
 
-def get_data_loaders(args, whole_audio=False):
-    data_train = AudioDataset(
-        args.data.train_path,
-        waveform_sec=args.data.duration,
-        hop_size=args.data.block_size,
-        sample_rate=args.data.sampling_rate,
-        load_all_data=args.train.cache_all_data,
-        whole_audio=whole_audio,
-        extensions=args.data.extensions,
-        n_spk=args.model.n_spk,
-        device=args.train.cache_device,
-        fp16=args.train.cache_fp16,
-        use_aug=True)
-    loader_train = torch.utils.data.DataLoader(
-        data_train ,
-        batch_size=args.train.batch_size if not whole_audio else 1,
-        shuffle=True,
-        num_workers=args.train.num_workers if args.train.cache_device=='cpu' else 0,
-        persistent_workers=(args.train.num_workers > 0) if args.train.cache_device=='cpu' else False,
-        pin_memory=True if args.train.cache_device=='cpu' else False
-    )
-    data_valid = AudioDataset(
-        args.data.valid_path,
-        waveform_sec=args.data.duration,
-        hop_size=args.data.block_size,
-        sample_rate=args.data.sampling_rate,
-        load_all_data=args.train.cache_all_data,
-        whole_audio=True,
-        extensions=args.data.extensions,
-        n_spk=args.model.n_spk)
-    loader_valid = torch.utils.data.DataLoader(
-        data_valid,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True
-    )
-    return loader_train, loader_valid 
+def get_data_loaders(args, whole_audio=False, frontend=False, load_audio=False,
+                     train_aug=True, aug_embd=False, use_short=False):
+    common = dict(hop_size=args.data.block_size, sample_rate=args.data.sampling_rate,
+                  load_all_data=args.train.cache_all_data, extensions=args.data.extensions,
+                  n_spk=args.model.n_spk, train_frontend=frontend)
+    training = AudioDataset(args.data.train_path, waveform_sec=args.data.duration,
+                            whole_audio=whole_audio, device=args.train.cache_device,
+                            fp16=args.train.cache_fp16, use_aug=train_aug, load_audio=load_audio,
+                            aug_embd=aug_embd, use_short=use_short, **common)
+    validation = AudioDataset(args.data.valid_path, waveform_sec=2, whole_audio=True,
+                              load_audio=True, fp16=False,
+                              speaker_means=training.speaker_means if frontend else None, **common)
+    workers = args.train.num_workers if args.train.cache_device == "cpu" else 0
+    loader_train = DataLoader(training, batch_size=1 if whole_audio else args.train.batch_size,
+                              shuffle=True, num_workers=workers, persistent_workers=workers > 0,
+                              pin_memory=args.train.cache_device == "cpu")
+    loader_valid = DataLoader(validation, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+    return loader_train, loader_valid
 
 
 class AudioDataset(Dataset):
-    def __init__(
-        self,
-        path_root,
-        waveform_sec,
-        hop_size,
-        sample_rate,
-        load_all_data=True,
-        whole_audio=False,
-        extensions=['wav'],
-        n_spk=1,
-        device='cpu',
-        fp16=False,
-        use_aug=False,
-    ):
-        super().__init__()
-        
-        self.sample_rate = sample_rate
-        self.hop_size = hop_size
-        self.crop_len = int(waveform_sec * sample_rate / hop_size)
-        self.path_root = path_root
-        self.paths = traverse_dir(
-            os.path.join(path_root, 'audio'),
-            extensions=extensions,
-            is_pure=True,
-            is_sort=True,
-            is_ext=True
-        )
+    def __init__(self, path_root, waveform_sec, hop_size, sample_rate,
+                 load_all_data=True, whole_audio=False, extensions=("wav",), n_spk=1,
+                 device="cpu", fp16=False, use_aug=False, train_frontend=False,
+                 load_audio=False, aug_embd=False,
+                 use_short=False, speaker_means=None):
+        self.path_root = str(path_root)
+        self.hop_size = int(hop_size)
+        self.sample_rate = int(sample_rate)
+        self.crop_len = max(1, int(waveform_sec * sample_rate / hop_size))
+        self.short_len = max(1, int(0.4 * sample_rate / hop_size))
         self.whole_audio = whole_audio
         self.use_aug = use_aug
-        self.data_buffer={}
-        self.pitch_aug_dict = np.load(os.path.join(self.path_root, 'pitch_aug_dict.npy'), allow_pickle=True).item()
-        if load_all_data:
-            print('Load all the data from :', path_root)
-        else:
-            print('Load the f0, volume data from :', path_root)
-        
-        def _load_single_file(name_ext):
-            name = os.path.splitext(name_ext)[0]
-
-            path_f0 = os.path.join(self.path_root, 'f0', name_ext) + '.npy'
-            f0 = np.load(path_f0)
-            f0_len = len(f0)
-            f0 = torch.from_numpy(f0).float().unsqueeze(-1).to(device)
-
-            path_volume = os.path.join(self.path_root, 'volume', name_ext) + '.npy'
-            volume = np.load(path_volume)
-            volume_len = len(volume)
-            volume = torch.from_numpy(volume).float().unsqueeze(-1).to(device)
-
-            path_augvol = os.path.join(self.path_root, 'aug_vol', name_ext) + '.npy'
-            aug_vol = np.load(path_augvol)
-            aug_vol_len = len(aug_vol)
-            aug_vol = torch.from_numpy(aug_vol).float().unsqueeze(-1).to(device)
-
+        self.train_frontend = train_frontend
+        self.load_audio = load_audio
+        self.aug_embd = aug_embd
+        self.use_short = use_short
+        self.device = device
+        self.fp16 = fp16
+        self.speaker_means = {} if speaker_means is None else {
+            speaker_id: mean.to(device=device, dtype=torch.float32)
+            for speaker_id, mean in speaker_means.items()}
+        self.paths = traverse_dir(os.path.join(self.path_root, "audio"), extensions,
+                                  is_pure=True, is_sort=True, is_ext=True)
+        if not self.paths:
+            raise ValueError(f"No audio files found under {self.path_root}/audio")
+        pitch_path = Path(self.path_root) / "pitch_aug_dict.npy"
+        self.pitch_aug_dict = np.load(pitch_path, allow_pickle=True).item() if pitch_path.is_file() else {}
+        self.data_buffer = {}
+        self.feature_dirs = {"mel": "mel", "aug_mel": "aug_mel", "units": "units"}
+        if train_frontend:
+            self.feature_dirs.update(units_w="whisper_units", units_h="hubert_units")
+        if aug_embd:
+            self.feature_dirs["units_aug"] = "units_aug"
+            if train_frontend:
+                self.feature_dirs.update(units_w_aug="whisper_units_aug", units_h_aug="hubert_units_aug")
+        for name_ext in tqdm(self.paths, desc="Loading dataset"):
+            data = {}
+            lengths = []
+            for key in ("f0", "volume", "aug_vol"):
+                array = np.load(self._path(key, name_ext))
+                lengths.append(len(array))
+                data[key] = torch.from_numpy(array).float().reshape(-1, 1).to(device)
+            for key, folder in self.feature_dirs.items():
+                file_path = self._path(folder, name_ext)
+                lengths.append(get_npy_shape(file_path)[0])
+                if load_all_data:
+                    data[key] = self._tensor(np.load(file_path))
+            data["frame_len"] = min(lengths)
+            speaker_id = 1
             if n_spk is not None and n_spk > 1:
-                dirname_split = re.split(r"_|\-", os.path.dirname(name_ext), 2)[0]
-                spk_id = int(dirname_split) if str.isdigit(dirname_split) else 0
-                if spk_id < 1 or spk_id > n_spk:
-                    raise ValueError(' [x] Muiti-speaker training error : spk_id must be a positive integer from 1 to n_spk ')
-            else:
-                spk_id = 1
-            spk_id = torch.LongTensor(np.array([spk_id])).to(device)
+                prefix = re.split(r"_|\-", os.path.dirname(name_ext), 2)[0]
+                speaker_id = int(prefix) if prefix.isdigit() else 0
+                if not 1 <= speaker_id <= n_spk:
+                    raise ValueError(f"Invalid speaker directory for {name_ext}; expected 1..{n_spk}")
+            data["spk_id"] = torch.tensor([speaker_id], device=device, dtype=torch.long)
+            if train_frontend and speaker_means is None and speaker_id not in self.speaker_means:
+                mean_path = Path(self.path_root) / "speaker_means" / f"{speaker_id}.npy"
+                self.speaker_means[speaker_id] = torch.from_numpy(np.load(mean_path)).float().to(device).squeeze()
+            if load_audio:
+                waveform, _ = librosa.load(Path(self.path_root) / "audio" / name_ext, sr=sample_rate)
+                data["gt_audio"] = torch.from_numpy(waveform).float().to(device)
+            self.data_buffer[name_ext] = data
+        if train_frontend:
+            for data in self.data_buffer.values():
+                speaker_id = data["spk_id"].item()
+                if speaker_id not in self.speaker_means:
+                    raise ValueError(f"No training speaker mean for speaker {speaker_id}")
+                data["spk_embd"] = self.speaker_means[speaker_id]
 
-            path_mel = os.path.join(self.path_root, 'mel', name_ext) + '.npy'
-            path_augmel = os.path.join(self.path_root, 'aug_mel', name_ext) + '.npy'
-            path_units = os.path.join(self.path_root, 'units', name_ext) + '.npy'
+    def _path(self, folder, name_ext):
+        return str(Path(self.path_root) / folder / (name_ext + ".npy"))
 
-            mel_len = get_npy_shape(path_mel)[0]
-            aug_mel_len = get_npy_shape(path_augmel)[0]
-            units_len = get_npy_shape(path_units)[0]
-            frame_len = min(mel_len, aug_mel_len, units_len, f0_len, volume_len, aug_vol_len)
+    def _tensor(self, array):
+        tensor = torch.from_numpy(np.array(array, copy=True)).to(self.device)
+        return tensor.half() if self.fp16 else tensor.float()
 
-            if load_all_data:
-                mel = np.load(path_mel)
-                mel = torch.from_numpy(mel).to(device)
+    def __getitems__(self, file_indices):
+        crop_len = self.crop_len
+        if self.use_short and not self.whole_audio and random.choice([True, False]):
+            crop_len = self.short_len
+        return [self.__getitem__(index, crop_len=crop_len) for index in file_indices]
 
-                aug_mel = np.load(path_augmel)
-                aug_mel = torch.from_numpy(aug_mel).to(device)
+    def __getitem__(self, file_idx, crop_len=None):
+        crop_len = self.crop_len if crop_len is None else crop_len
+        for offset in range(len(self.paths)):
+            name_ext = self.paths[(file_idx + offset) % len(self.paths)]
+            data = self.data_buffer[name_ext]
+            if self.whole_audio or data["frame_len"] >= crop_len:
+                return self.get_data(name_ext, data, crop_len)
+        raise ValueError(f"Every clip is shorter than the requested {crop_len}-frame crop")
 
-                units = np.load(path_units)
-                units = torch.from_numpy(units).to(device)
+    def frame_idx_to_audio(self, embedding_start_idx, embedding_end_idx):
+        """Cached features are already aligned to the output hop, not the raw encoder hop."""
+        return embedding_start_idx * self.hop_size, embedding_end_idx * self.hop_size
 
-                if fp16:
-                    mel = mel.half()
-                    aug_mel = aug_mel.half()
-                    units = units.half()
-                else:
-                    # Do not rely on np.load's dtype. With preprocess.py's
-                    # --store_dtype fp16 these files are fp16 on disk, and
-                    # feeding fp16 tensors into fp32 model weights fails in
-                    # conv1d with "Input type (struct c10::Half) and bias type
-                    # (float) should be the same" -- reachable through the
-                    # validation dataset, which is built with fp16=False and
-                    # runs test() without autocast.
-                    mel = mel.float()
-                    aug_mel = aug_mel.float()
-                    units = units.float()
+    def get_data(self, name_ext, data_buffer, crop_len=None):
+        crop_len = self.crop_len if crop_len is None else crop_len
+        start = 0 if self.whole_audio else random.randint(0, data_buffer["frame_len"] - crop_len)
+        frames = data_buffer["frame_len"] if self.whole_audio else crop_len
+        end = start + frames
+        aug = random.choice([True, False]) and self.use_aug
+        units_aug = random.choice([True, False]) and self.aug_embd
 
-                data_dict = {
-                        'frame_len': frame_len,
-                        'mel': mel,
-                        'aug_mel': aug_mel,
-                        'units': units,
-                        'f0': f0,
-                        'volume': volume,
-                        'aug_vol': aug_vol,
-                        'spk_id': spk_id
-                        }
-            else:
-                data_dict = {
-                        'frame_len': frame_len,
-                        'f0': f0,
-                        'volume': volume,
-                        'aug_vol': aug_vol,
-                        'spk_id': spk_id
-                        }
-            return name_ext, data_dict
+        def feature(key, folder):
+            tensor = data_buffer.get(key)
+            if tensor is not None:
+                return tensor[start:end]
+            array = np.load(self._path(folder, name_ext), mmap_mode="r")
+            return self._tensor(array[start:end])
 
-        max_workers = max(min(32, os.cpu_count()), 4)
-        print(f'Using {max_workers} workers for parallel data loading')
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_name = {executor.submit(_load_single_file, name_ext): name_ext for name_ext in self.paths}
-            for future in tqdm(concurrent.futures.as_completed(future_to_name), total=len(self.paths), desc='Loading data'):
-                try:
-                    name_ext, data_dict = future.result()
-                    self.data_buffer[name_ext] = data_dict
-                except Exception as e:
-                    print(f'Error loading {future_to_name[future]}: {e}')
-                    raise
-
-    def __getitem__(self, file_idx):
-        name_ext = self.paths[file_idx]
-        data_buffer = self.data_buffer[name_ext]
-        # check duration. if too short, then skip
-        if data_buffer['frame_len'] < self.crop_len:
-            return self.__getitem__( (file_idx + 1) % len(self.paths))
-            
-        # get item
-        return self.get_data(name_ext, data_buffer)
-
-    def get_data(self, name_ext, data_buffer):
-        name = os.path.splitext(name_ext)[0]
-        start_frame = 0 if self.whole_audio else random.randint(0, data_buffer['frame_len'] - self.crop_len)
-        units_frame_len = data_buffer['frame_len'] if self.whole_audio else self.crop_len
-        aug_flag = random.choice([True, False]) and self.use_aug
-
-        # load mel
-        mel_key = 'aug_mel' if aug_flag else 'mel'
-        mel = data_buffer.get(mel_key)
-        if mel is None:
-            mel = os.path.join(self.path_root, mel_key, name_ext) + '.npy'
-            mel = np.load(mel, mmap_mode='r')
-            mel = mel[start_frame : start_frame + units_frame_len].copy()
-            mel = torch.from_numpy(mel).float() 
-        else:
-            mel = mel[start_frame : start_frame + units_frame_len]
-            
-        # load units
-        units = data_buffer.get('units')
-        if units is None:
-            units = os.path.join(self.path_root, 'units', name_ext) + '.npy'
-            units = np.load(units, mmap_mode='r')
-            units = units[start_frame : start_frame + units_frame_len].copy()
-            units = torch.from_numpy(units).float() 
-        else:
-            units = units[start_frame : start_frame + units_frame_len]
-
-        # load f0
-        f0 = data_buffer.get('f0')
-        aug_shift = 0
-        if aug_flag:
-            aug_shift = self.pitch_aug_dict[name_ext]
-        f0_frames = 2 ** (aug_shift / 12) * f0[start_frame : start_frame + units_frame_len]
-        
-        # load volume
-        vol_key = 'aug_vol' if aug_flag else 'volume'
-        volume = data_buffer.get(vol_key)
-        volume_frames = volume[start_frame : start_frame + units_frame_len]
-        
-        # load spk_id
-        spk_id = data_buffer.get('spk_id')
-        
-        # load shift
-        aug_shift = torch.from_numpy(np.array([[aug_shift]])).float()
-        
-        return dict(mel=mel, f0=f0_frames, volume=volume_frames, units=units, spk_id=spk_id, aug_shift=aug_shift, name=name, name_ext=name_ext)
+        units_original = feature("units", "units")
+        units = feature("units_aug", "units_aug") if units_aug else units_original
+        shift = self.pitch_aug_dict[name_ext] if aug else 0
+        data = dict(mel=feature("aug_mel" if aug else "mel", "aug_mel" if aug else "mel"),
+                    units=units, f0=data_buffer["f0"][start:end] * 2 ** (shift / 12),
+                    volume=data_buffer["aug_vol" if aug else "volume"][start:end],
+                    spk_id=data_buffer["spk_id"], aug_shift=torch.tensor([[shift]], dtype=torch.float32),
+                    name=os.path.splitext(name_ext)[0], name_ext=name_ext)
+        if self.train_frontend:
+            for key, folder in (("units_w", "whisper_units"), ("units_h", "hubert_units")):
+                data[key] = feature(key + "_aug", folder + "_aug") if units_aug else feature(key, folder)
+            data["units_ori"] = units_original
+            data["spk_embd"] = data_buffer["spk_embd"]
+        if self.load_audio:
+            audio_start, audio_end = self.frame_idx_to_audio(start, end)
+            waveform = data_buffer["gt_audio"][audio_start:audio_end]
+            data["gt_audio"] = F.pad(waveform, (0, frames * self.hop_size - waveform.numel()))
+        return data
 
     def __len__(self):
         return len(self.paths)

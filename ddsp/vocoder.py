@@ -3,10 +3,6 @@ import numpy as np
 import yaml
 import torch
 import torch.nn.functional as F
-import pyworld as pw
-import parselmouth
-import torchcrepe
-import resampy
 from transformers import HubertModel, HubertConfig, Wav2Vec2FeatureExtractor
 from encoder.hubert.model import HubertSoft
 from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
@@ -52,6 +48,7 @@ class F0_Extractor:
         
         # extract f0 using parselmouth
         if self.f0_extractor == 'parselmouth':
+            import parselmouth
             l_pad = int(np.ceil(1.5 / self.f0_min * self.sample_rate))
             r_pad = int(self.hop_size * ((len(audio) - 1) // self.hop_size + 1) - len(audio) + l_pad + 1)
             s = parselmouth.Sound(np.pad(audio, (l_pad, r_pad)), self.sample_rate).to_pitch_ac(
@@ -67,6 +64,7 @@ class F0_Extractor:
             
         # extract f0 using dio
         elif self.f0_extractor == 'dio':
+            import pyworld as pw
             _f0, t = pw.dio(
                 audio.astype('double'), 
                 self.sample_rate, 
@@ -79,6 +77,7 @@ class F0_Extractor:
         
         # extract f0 using harvest
         elif self.f0_extractor == 'harvest':
+            import pyworld as pw
             f0, _ = pw.harvest(
                 audio.astype('double'), 
                 self.sample_rate, 
@@ -89,6 +88,7 @@ class F0_Extractor:
         
         # extract f0 using crepe        
         elif self.f0_extractor == 'crepe':
+            import torchcrepe
             if device is None:
                 device = 'cuda' if torch.cuda.is_available() else 'cpu'
             resample_kernel = self.resample_kernel.to(device)
@@ -177,6 +177,12 @@ class Units_Encoder:
             is_loaded_encoder = True
         if encoder == 'cnhubertsoftfish':
             self.model = CNHubertSoftFish(encoder_ckpt, device=device, gate_size=cnhubertsoft_gate)
+            is_loaded_encoder = True
+        if encoder == 'hubertsofttta2x':
+            self.model = Audio2HubertSoftTTA2X(encoder_ckpt).to(device)
+            is_loaded_encoder = True
+        if encoder in ('whisper-large-pgg', 'whisper-large-pgg-tta2x'):
+            self.model = Audio2WhisperPpgLarge(encoder_ckpt, device, tta=encoder.endswith('tta2x'))
             is_loaded_encoder = True
         if not is_loaded_encoder:
             raise ValueError(f" [x] Unknown units encoder: {encoder}")
@@ -440,3 +446,33 @@ class CombSubSuperFast(torch.nn.Module):
                         center = True)
 
         return signal, hidden
+
+
+class Audio2HubertSoftTTA2X(Audio2HubertSoft):
+    @torch.no_grad()
+    def forward(self, audio):
+        first = self.hubert.units(audio.unsqueeze(1))
+        shifted = self.hubert.units(F.pad(audio, (160, 0)).unsqueeze(1))
+        if shifted.shape[1] > first.shape[1]:
+            first = F.pad(first, (0, 0, 0, shifted.shape[1] - first.shape[1]))
+        return torch.cat((shifted, first), dim=2).reshape(first.shape[0], -1, first.shape[-1])[:, 1:]
+
+
+class Audio2WhisperPpgLarge(torch.nn.Module):
+    def __init__(self, path, device='cpu', tta=False):
+        super().__init__()
+        from encoder.whisper.inference import load_ppg_model
+        self.model = load_ppg_model(path, device)
+        self.device = device
+        self.tta = tta
+
+    @torch.no_grad()
+    def forward(self, audio):
+        from encoder.whisper.inference import pred_ppg
+        first = pred_ppg(self.model, audio, self.device)
+        if not self.tta:
+            return first
+        shifted = pred_ppg(self.model, F.pad(audio, (160, 0)), self.device)
+        if shifted.shape[1] > first.shape[1]:
+            first = F.pad(first, (0, 0, 0, shifted.shape[1] - first.shape[1]))
+        return torch.cat((shifted, first), dim=2).reshape(first.shape[0], -1, first.shape[-1])[:, 1:]
