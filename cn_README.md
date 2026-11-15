@@ -243,7 +243,7 @@ TensorBoard 日志默认写入前端实验目录下的 `logs/`：
 - [Diffusion-SVC](https://github.com/CNChTu/Diffusion-SVC)
 - [SO-VITS-SVC](https://github.com/svc-develop-team/so-vits-svc)
 - [Whisper](https://github.com/openai/whisper)
-- [whisper-vits-svc](https://github.com/PlayVoice/whisper-vits-svc)
+- [whisper-vits-svc](https://github.com/ShadowLoveElysia/Whisper-vits-svc-LargeV3)
 - [SpeechBrain](https://github.com/speechbrain/speechbrain)
 - [FAISS](https://github.com/facebookresearch/faiss)
 - [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)

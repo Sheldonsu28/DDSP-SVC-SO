@@ -274,7 +274,7 @@ class QExitAdaptiveDecoder(nn.Module):
         return (output, {'reconstruction_loss': reconstruction_loss, 'entropy': entropy, 'expected_steps': expected_steps, 'exit_steps': exit_steps, 'exit_probabilities': probabilities, 'exit_cdf': torch.stack(cdfs, dim=1), 'loops_run': step, 'loop_budget': budget})
 
 class SoftVcStylizer(nn.Module):
-
+    """ Multi-source input inspired by https://github.com/ShadowLoveElysia/Whisper-vits-svc-LargeV3"""
     def __init__(self, input_dim=2304, latent_dim=256, mel_bins=128, decoder_dim=768, num_flow_layers=4, decoder_layers=1, spk_dim=192, train_formant=True, decoder_max_loops=25, decoder_q_exit=0.75, decoder_reconstruction_dim=64, decoder_checkpoint=True):
         super().__init__()
         self.latent_dim = latent_dim

@@ -189,7 +189,7 @@ The front-end uses technologies such as sliding window, cross-fading, SOLA-based
 
 - [SO-VITS-SVC](https://github.com/svc-develop-team/so-vits-svc)
 
-- [whisper-vits-svc](https://github.com/PlayVoice/whisper-vits-svc)
+- [whisper-vits-svc](https://github.com/ShadowLoveElysia/Whisper-vits-svc-LargeV3)
 
 - [Whisper](https://github.com/openai/whisper)
 
