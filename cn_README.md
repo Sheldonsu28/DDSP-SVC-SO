@@ -2,7 +2,7 @@ Language: [English](./README.md) **简体中文**
 
 # DDSP-SVC
 
-DDSP-SVC 是一个开源歌声转换项目。本分支在上游 DDSP / Rectified-Flow 基础上，提供 SoftVcStylizer 前端、完整音频判别器和 NSF-HifiGAN 的训练与推理流程。
+本分支在上游 DDSP / Rectified-Flow 基础上，提供 SoftVcStylizer 前端、完整音频判别器和 NSF-HifiGAN 的训练与推理流程。
 
 与上游 DDSP 相比，本仓库改善了合成语音的发音表现，并提高了目标说话人音色的还原度，代价是需要更高的训练成本。
 

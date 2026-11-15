@@ -4,7 +4,7 @@ Language: **English** [简体中文](./cn_README.md)
 
 ## 0. Introduction
 
-DDSP-SVC is an open source singing voice conversion project. This branch builds on upstream DDSP / Rectified-Flow and provides training and inference workflows with the SoftVcStylizer frontend, the full audio discriminator, and NSF-HifiGAN.
+This branch builds on upstream DDSP / Rectified-Flow and provides training and inference workflows with the SoftVcStylizer frontend, the full audio discriminator, and NSF-HifiGAN.
 
 Compared with upstream DDSP, this repository improves pronunciation in synthesized speech and more faithfully reconstructs the target speaker's timbre, at the cost of higher training resource requirements.
 
