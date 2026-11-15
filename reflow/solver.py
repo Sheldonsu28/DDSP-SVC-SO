@@ -3,6 +3,7 @@ import time
 import numpy as np
 import torch
 import librosa
+import torchaudio
 from logger.saver import Saver
 from logger import utils
 from torch.amp import autocast, GradScaler
@@ -446,6 +447,9 @@ def train_vc_osgan(args, initial_global_step, style_model, model_g, model_d, opt
         dtype = torch.bfloat16
     else:
         raise ValueError(' [x] Unknown amp_dtype: ' + args.train.amp_dtype)
+    
+    transform = torchaudio.transforms.Resample(44100, 32000).to('cuda')
+    
     spkc_criterion = nn.CosineEmbeddingLoss()
     gradient_accumulation_steps = 1
     accumulation_counter = 0
@@ -468,8 +472,8 @@ def train_vc_osgan(args, initial_global_step, style_model, model_g, model_d, opt
                     (units, mu_pr, logvar_pr, mu_ps, logvar_ps, z_fwd, z_pr, z_bkw, log_det_bkw, spk_pred, formant, log_det_fwd, z_ps, mask) = outputs
                     (ddsp_loss, reflow_loss, ddsp_band_loss, ddsp_wav, ddsp_mel) = model_g(units, data['f0'], data['volume'], data['spk_id'], aug_shift=data['aug_shift'] + formant, vocoder=vocoder, gt_spec=data['mel'].float(), infer=False, t_start=args.model.t_start)
             spk_loss = 1 * spkc_criterion(data['spk_embd'], spk_pred, torch.ones(spk_pred.size(0), device=args.device))
-            transformed_fake = ddsp_wav
-            transformed_real = data['gt_audio']
+            transformed_fake = transform(ddsp_wav)
+            transformed_real = transform(data['gt_audio'])
             if dtype == torch.float32:
                 (score_loss, feat_loss, loss_d) = model_d.compute_losses(transformed_fake, transformed_real)
             else:
