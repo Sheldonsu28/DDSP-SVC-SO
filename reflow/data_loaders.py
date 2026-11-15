@@ -74,15 +74,19 @@ class AudioDataset(Dataset):
         self.pitch_aug_dict = np.load(pitch_path, allow_pickle=True).item() if pitch_path.is_file() else {}
         self.data_buffer = {}
         self.feature_dirs = {"mel": "mel", "aug_mel": "aug_mel", "units": "units"}
+        
         if train_frontend:
-            self.feature_dirs.update(units_w="whisper_units", units_h="hubert_units")
+            self.feature_dirs.update(units_w="whisper_units", units_h="hubert_units", spk_embd="speaker")
+            
         if aug_embd:
             self.feature_dirs["units_aug"] = "units_aug"
             if train_frontend:
                 self.feature_dirs.update(units_w_aug="whisper_units_aug", units_h_aug="hubert_units_aug")
+                
         for name_ext in tqdm(self.paths, desc="Loading dataset"):
             data = {}
             lengths = []
+            
             for key in ("f0", "volume", "aug_vol"):
                 array = np.load(self._path(key, name_ext))
                 lengths.append(len(array))
@@ -112,7 +116,7 @@ class AudioDataset(Dataset):
                 speaker_id = data["spk_id"].item()
                 if speaker_id not in self.speaker_means:
                     raise ValueError(f"No training speaker mean for speaker {speaker_id}")
-                data["spk_embd"] = self.speaker_means[speaker_id]
+                data["spk_embd"] = self.speaker_means[speaker_id] if torch.cosine_similarity(data["spk_embd"], self.speaker_means[speaker_id], dim=0) > 0.85 else data["spk_embd"]
 
     def _path(self, folder, name_ext):
         return str(Path(self.path_root) / folder / (name_ext + ".npy"))
