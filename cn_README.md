@@ -112,7 +112,7 @@ frontend:
 
 显式提供的命令行资源路径优先于 YAML。推理时可用 `--frontend_checkpoint`、`--speaker_embedding`、`--index_dir`，或者单独的 `--contentvec_index`、`--hubert_index`、`--whisper_index` 指定资源。
 
-前端预处理按说话人编号，使用成功处理的切片计算 ECAPA 嵌入算术均值，并以 FP32 保存到数据集目录下的 `speaker_means/<speaker_id>.npy`。训练时每个说话人的均值文件只加载一次，验证集复用训练集均值；缓存和非缓存模式均适用，不再使用全局均值文件或相似度阈值。启用前端推理时，`main_reflow.py` 自动从 `data.train_path/speaker_means/<spk_id>.npy` 加载均值，使用 `-id` / `--spk_id`（默认 1）选择说话人，在处理音频前只加载一次。`-c` 配置中的 `data.train_path` 优先于模型保存的训练路径。可选的 `speaker_embedding` 配置或 `--speaker_embedding` 参数仅用于推理，可指定均值文件或目录以覆盖默认路径；指定目录时同样按 `<spk_id>.npy` 选择文件。
+前端预处理按说话人编号，仅使用成功处理的训练切片计算 ECAPA 嵌入算术均值，并将相同的 FP32 均值分别保存到 `data.train_path/speaker_means/<speaker_id>.npy` 和 `data.valid_path/speaker_means/<speaker_id>.npy`。验证切片不参与均值计算。训练时每个说话人的均值文件只加载一次，验证集复用训练集均值；缓存和非缓存模式均适用，不再使用全局均值文件或相似度阈值。启用前端推理时，`main_reflow.py` 自动从 `data.train_path/speaker_means/<spk_id>.npy` 加载均值，使用 `-id` / `--spk_id`（默认 1）选择说话人，在处理音频前只加载一次。`-c` 配置中的 `data.train_path` 优先于模型保存的训练路径。可选的 `speaker_embedding` 配置或 `--speaker_embedding` 参数仅用于推理，可指定均值文件或目录以覆盖默认路径；指定目录时同样按 `<spk_id>.npy` 选择文件。
 
 ### 3.3. 执行预处理
 

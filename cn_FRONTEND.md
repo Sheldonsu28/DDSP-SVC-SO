@@ -12,12 +12,12 @@ python -m venv .venv
 
 CUDA 安装命令对应 [PyTorch 官方历史版本说明](https://pytorch.org/get-started/previous-versions/)。Torch 和 Torchaudio 均应显示 `2.11.0+cu126`，`torch.cuda.is_available()` 应返回 `True`。`requirements-pitch.txt` 为 Parselmouth、WORLD、CREPE 和 FCPE 的可选依赖；默认 RMVPE 流程不需要这些包。GUI 和实时音频设备工具不在当前依赖清单的覆盖范围内。
 
-请自行在本地准备以下公共预训练资源。这些文件被 Git 忽略，本次迁移不会从其他实验中复制它们：
+请自行在本地准备以下公共预训练资源：
 
 | 资源 | 默认路径或配置 | 说明 |
 | --- | --- | --- |
 | Hugging Face ContentVec | `pretrain/contentvec/pytorch_model.bin` | 使用上游转换后的检查点，不使用 Fairseq 的旧 `.pt` 格式。 |
-| Whisper large-v2 | `pretrain/ppg-large/large-v2.pt` | 标准检查点需包含 `dims` 和 `model_state_dict`；PPG 加载器保留音频编码器的前四分之三层，不需要文本解码。 |
+| [Whisper large-v2](https://openaipublic.azureedge.net/main/whisper/models/81f7c96c852ee8fc832187b0132e569d6c3065a3252ed18e56effd0b6a73e524/large-v2.pt) | `pretrain/ppg-large/large-v2.pt` | 标准检查点需包含 `dims` 和 `model_state_dict`；PPG 加载器保留音频编码器的前四分之三层，不需要文本解码。 |
 | HuBERT Soft | `pretrain/hubert/hubert-soft.pt` | 使用与仓库内实现匹配的公共 HuBERT Soft 权重。 |
 | RMVPE | `pretrain/rmvpe/model.pt` | 默认音高提取器。 |
 | NSF-HifiGAN | YAML 中的 `vocoder.ckpt` | 匹配的 `config.json` 必须放在权重旁边。采样率和 hop size 必须与数据配置一致。 |
@@ -42,7 +42,7 @@ frontend:
   model: {}                     # SoftVcStylizer 构造参数；随检查点配置保存
 ```
 
-显式提供的命令行资源路径优先于 YAML。前端预处理按说话人编号，使用成功处理的切片计算 ECAPA 嵌入算术均值，并以 FP32 保存到数据集目录下的 `speaker_means/<speaker_id>.npy`。训练时每个说话人的均值文件只加载一次，验证集复用训练集均值；缓存和非缓存模式均适用。不再使用全局均值文件或相似度阈值。启用前端推理时，`main_reflow.py` 自动从 `data.train_path/speaker_means/<spk_id>.npy` 加载均值，使用 `-id` / `--spk_id`（默认 1）选择说话人，在处理音频前只加载一次。`-c` 配置中的 `data.train_path` 优先于模型保存的训练路径。可选的 `speaker_embedding` 配置或 `--speaker_embedding` 参数仅用于推理，可指定均值文件或目录以覆盖默认路径；指定目录时同样按 `<spk_id>.npy` 选择文件。
+显式提供的命令行资源路径优先于 YAML。前端预处理按说话人编号，仅使用成功处理的训练切片计算 ECAPA 嵌入算术均值，并将相同的 FP32 均值分别保存到 `data.train_path/speaker_means/<speaker_id>.npy` 和 `data.valid_path/speaker_means/<speaker_id>.npy`。验证切片不参与均值计算。训练时每个说话人的均值文件只加载一次，验证集复用训练集均值；缓存和非缓存模式均适用。不再使用全局均值文件或相似度阈值。启用前端推理时，`main_reflow.py` 自动从 `data.train_path/speaker_means/<spk_id>.npy` 加载均值，使用 `-id` / `--spk_id`（默认 1）选择说话人，在处理音频前只加载一次。`-c` 配置中的 `data.train_path` 优先于模型保存的训练路径。可选的 `speaker_embedding` 配置或 `--speaker_embedding` 参数仅用于推理，可指定均值文件或目录以覆盖默认路径；指定目录时同样按 `<spk_id>.npy` 选择文件。
 
 训练器默认恢复 `env.style_dir` 中编号最大的检查点。`frontend.checkpoint` 或 `--frontend_checkpoint` 可选择某个 GAN 检查点；新的输出仍写入 `env.style_dir`。
 

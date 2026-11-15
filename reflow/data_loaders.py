@@ -1,4 +1,5 @@
 """Aligned upstream and SoftVcStylizer frontend training datasets."""
+import concurrent.futures
 import os
 import random
 import re
@@ -83,7 +84,7 @@ class AudioDataset(Dataset):
             if train_frontend:
                 self.feature_dirs.update(units_w_aug="whisper_units_aug", units_h_aug="hubert_units_aug")
                 
-        for name_ext in tqdm(self.paths, desc="Loading dataset"):
+        def _load_single_file(name_ext):
             data = {}
             lengths = []
             
@@ -104,16 +105,29 @@ class AudioDataset(Dataset):
                 if not 1 <= speaker_id <= n_spk:
                     raise ValueError(f"Invalid speaker directory for {name_ext}; expected 1..{n_spk}")
             data["spk_id"] = torch.tensor([speaker_id], device=device, dtype=torch.long)
-            if train_frontend and speaker_means is None and speaker_id not in self.speaker_means:
-                mean_path = Path(self.path_root) / "speaker_means" / f"{speaker_id}.npy"
-                self.speaker_means[speaker_id] = torch.from_numpy(np.load(mean_path)).float().to(device).squeeze()
             if load_audio:
                 waveform, _ = librosa.load(Path(self.path_root) / "audio" / name_ext, sr=sample_rate)
                 data["gt_audio"] = torch.from_numpy(waveform).float().to(device)
-            self.data_buffer[name_ext] = data
+            return name_ext, data
+
+        max_workers = max(min(32, os.cpu_count() or 1), 4)
+        print(f"Using {max_workers} workers for parallel data loading")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_name = {executor.submit(_load_single_file, name_ext): name_ext for name_ext in self.paths}
+            for future in tqdm(concurrent.futures.as_completed(future_to_name), total=len(self.paths), desc="Loading data"):
+                try:
+                    name_ext, data = future.result()
+                    self.data_buffer[name_ext] = data
+                except Exception as error:
+                    print(f"Error loading {future_to_name[future]}: {error}")
+                    raise
         if train_frontend:
+            # Load each mean once on the main thread, after per-file loading finishes.
             for data in self.data_buffer.values():
                 speaker_id = data["spk_id"].item()
+                if speaker_means is None and speaker_id not in self.speaker_means:
+                    mean_path = Path(self.path_root) / "speaker_means" / f"{speaker_id}.npy"
+                    self.speaker_means[speaker_id] = torch.from_numpy(np.load(mean_path)).float().to(device).squeeze()
                 if speaker_id not in self.speaker_means:
                     raise ValueError(f"No training speaker mean for speaker {speaker_id}")
                 data["spk_embd"] = self.speaker_means[speaker_id] if torch.cosine_similarity(data["spk_embd"], self.speaker_means[speaker_id], dim=0) > 0.85 else data["spk_embd"]

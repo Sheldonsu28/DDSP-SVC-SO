@@ -25,7 +25,7 @@ def parse_args(args=None, namespace=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-c", "--config", required=True)
     parser.add_argument("-d", "--device", default=None)
-    parser.add_argument("-j", "--workers", type=int, default=None,
+    parser.add_argument("-j", "--workers", type=int, default=2,
                         help="Worker processes; default 2 upstream, 1 with the multi-encoder frontend")
     parser.add_argument("--store_dtype", choices=("fp32", "fp16"), default="fp32")
     parser.add_argument("--frontend", action="store_true", help="Extract SoftVcStylizer auxiliary features and speaker embeddings")
@@ -139,37 +139,40 @@ def _process_file(file, path, sample_rate, hop_size, use_pitch_aug, extensions):
     return keyshift
 
 
-def save_speaker_means(path, files, n_spk=1):
-    """Save one FP32 mean per speaker from successfully preprocessed clips."""
-    totals, counts = {}, {}
-    for file in files:
-        speaker_id = 1
-        if n_spk is not None and n_spk > 1:
-            prefix = re.split(r"_|\-", os.path.dirname(file), 2)[0]
-            speaker_id = int(prefix) if prefix.isdigit() else 0
-            if not 1 <= speaker_id <= n_spk:
-                raise ValueError(f"Invalid speaker directory for {file}; expected 1..{n_spk}")
-        speaker = np.load(Path(path) / "speaker" / (file + ".npy")).astype(np.float32).squeeze()
-        if speaker_id not in totals:
-            totals[speaker_id] = speaker
-        else:
-            totals[speaker_id] += speaker
-        counts[speaker_id] = counts.get(speaker_id, 0) + 1
+def save_speaker_means(path, files, n_spk=1, speaker_means=None):
+    """Save FP32 speaker means, computing them only when none are supplied."""
+    if speaker_means is None:
+        totals, counts = {}, {}
+        for file in files:
+            speaker_id = 1
+            if n_spk is not None and n_spk > 1:
+                prefix = re.split(r"_|\-", os.path.dirname(file), 2)[0]
+                speaker_id = int(prefix) if prefix.isdigit() else 0
+                if not 1 <= speaker_id <= n_spk:
+                    raise ValueError(f"Invalid speaker directory for {file}; expected 1..{n_spk}")
+            speaker = np.load(Path(path) / "speaker" / (file + ".npy")).astype(np.float32).squeeze()
+            if speaker_id not in totals:
+                totals[speaker_id] = speaker
+            else:
+                totals[speaker_id] += speaker
+            counts[speaker_id] = counts.get(speaker_id, 0) + 1
+        speaker_means = {speaker_id: total / counts[speaker_id] for speaker_id, total in totals.items()}
     destination = Path(path) / "speaker_means"
     destination.mkdir(exist_ok=True)
-    for speaker_id, total in totals.items():
-        np.save(destination / f"{speaker_id}.npy", total / counts[speaker_id])
+    for speaker_id, mean in speaker_means.items():
+        np.save(destination / f"{speaker_id}.npy", mean)
+    return speaker_means
 
 
 def preprocess(path, args, sample_rate=None, hop_size=None, device="cuda",
-               use_pitch_aug=False, extensions=("wav",), workers=1, store_dtype=None):
+               use_pitch_aug=False, extensions=("wav",), workers=1, store_dtype=None, speaker_means=None):
     sample_rate = sample_rate or args.data.sampling_rate
     hop_size = hop_size or args.data.block_size
     files = utils.traverse_dir(str(Path(path) / "audio"), extensions,
                                is_pure=True, is_sort=True, is_ext=True)
     if not files:
         print(f"No audio files found under {path}/audio")
-        return
+        return speaker_means if speaker_means is not None else {}
     if workers < 1:
         raise ValueError("workers must be at least 1")
     store_dtype = np.float32 if store_dtype is None else store_dtype
@@ -187,20 +190,21 @@ def preprocess(path, args, sample_rate=None, hop_size=None, device="cuda",
     pitch_shifts = {file: shift for file, shift in zip(files, results) if shift is not None}
     np.save(Path(path) / "pitch_aug_dict.npy", pitch_shifts)
     if options(args).get("enabled"):
-        save_speaker_means(path, pitch_shifts, args.model.n_spk)
+        return save_speaker_means(path, pitch_shifts, args.model.n_spk, speaker_means)
 
 
 def main():
     command = parse_args()
     args = utils.load_config(command.config)
-    settings = apply_overrides(args, command)
     device = command.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    workers = command.workers if command.workers is not None else (1 if settings.get("enabled") else 2)
+    workers = command.workers if command.workers is not None else 2
     store_dtype = np.float16 if command.store_dtype == "fp16" else np.float32
+    speaker_means = None
     for path, augment in ((args.data.train_path, bool(args.model.use_pitch_aug)),
                           (args.data.valid_path, False)):
-        preprocess(path, args, device=device, workers=workers, store_dtype=store_dtype,
-                   use_pitch_aug=augment, extensions=args.data.extensions)
+        speaker_means = preprocess(path, args, device=device, workers=workers, store_dtype=store_dtype,
+                                   use_pitch_aug=augment, extensions=args.data.extensions,
+                                   speaker_means=speaker_means)
 
 
 if __name__ == "__main__":
