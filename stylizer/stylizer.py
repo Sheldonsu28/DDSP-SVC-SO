@@ -305,7 +305,7 @@ class SoftVcStylizer(nn.Module):
             if len(speaker_feat.shape) == 1:
                 speaker_feat = speaker_feat.unsqueeze(0)
         else:
-            contentvec_feats_proj = contentvec_feats + torch.randn_like(contentvec_feats) * 2
+            contentvec_feats_proj = contentvec_feats + torch.randn_like(contentvec_feats) * 2.0
             whisper_feats += torch.randn_like(whisper_feats) * 1.0
             hubert_feats += torch.randn_like(hubert_feats) * 2.0
         if not infer:
@@ -333,7 +333,7 @@ class SoftVcStylizer(nn.Module):
             z_fwd = None
         if infer:
             x = z_bkw
-        elif steps >= 30000:
+        elif steps >= 20000:
             p = torch.rand(1)
             if p.item() >= 0.3:
                 x = z_ps
