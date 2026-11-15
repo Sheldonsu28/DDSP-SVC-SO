@@ -94,7 +94,8 @@ class AudioDataset(Dataset):
                 data[key] = torch.from_numpy(array).float().reshape(-1, 1).to(device)
             for key, folder in self.feature_dirs.items():
                 file_path = self._path(folder, name_ext)
-                lengths.append(get_npy_shape(file_path)[0])
+                if key != "spk_embd":
+                    lengths.append(get_npy_shape(file_path)[0])
                 if load_all_data:
                     data[key] = self._tensor(np.load(file_path))
             data["frame_len"] = min(lengths)
